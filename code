@@ -1,0 +1,566 @@
+/*
+ * Interrupt-Based Digital Tachometer
+ * MCU      : PIC16F877A
+ * Compiler : MPLAB XC8
+ * Clock    : 20 MHz
+ *
+ * IR Sensor  -> RB0/INT
+ * Timer1     -> 1 second measurement window
+ * LCD        -> PORTD
+ * LED        -> RD6
+ */
+
+#include <xc.h>
+#include <stdint.h>
+
+/*========================================================
+  CONFIGURATION
+========================================================*/
+
+#define _XTAL_FREQ 20000000UL
+
+#pragma config FOSC = HS
+#pragma config WDTE = OFF
+#pragma config PWRTE = ON
+#pragma config BOREN = ON
+#pragma config LVP = OFF
+#pragma config CPD = OFF
+#pragma config WRT = OFF
+#pragma config CP = OFF
+
+
+/*========================================================
+  USER SETTINGS
+========================================================*/
+
+/*
+ * Number of IR pulses produced for one revolution.
+ *
+ * 1 pulse/revolution -> PPR = 1
+ * 2 pulses/revolution -> PPR = 2
+ */
+#define PULSES_PER_REVOLUTION   1UL
+
+/*
+ * Maximum allowed RPM.
+ * LED turns ON when RPM exceeds this value.
+ */
+#define MAX_RPM                 3000UL
+
+
+/*========================================================
+  LCD PIN DEFINITIONS
+========================================================*/
+
+#define LCD_RS      RD0
+#define LCD_EN      RD1
+
+#define LCD_D4      RD2
+#define LCD_D5      RD3
+#define LCD_D6      RD4
+#define LCD_D7      RD5
+
+#define OVERSPEED_LED RD6
+
+
+/*========================================================
+  GLOBAL VARIABLES
+========================================================*/
+
+/*
+ * pulse_count:
+ * Number of pulses detected during current
+ * 1-second measurement period.
+ */
+volatile uint16_t pulse_count = 0;
+
+/*
+ * timer1_ticks:
+ * Counts 50-ms Timer1 interrupts.
+ *
+ * 20 × 50 ms = 1 second
+ */
+volatile uint8_t timer1_ticks = 0;
+
+/*
+ * measurement_ready:
+ * Set by ISR when 1-second measurement is complete.
+ */
+volatile uint8_t measurement_ready = 0;
+
+
+/*========================================================
+  LCD FUNCTIONS
+========================================================*/
+
+void LCD_Pulse_Enable(void)
+{
+    LCD_EN = 1;
+    __delay_us(5);
+
+    LCD_EN = 0;
+    __delay_us(5);
+}
+
+
+void LCD_Send_Nibble(uint8_t data)
+{
+    LCD_D4 = (data >> 0) & 1;
+    LCD_D5 = (data >> 1) & 1;
+    LCD_D6 = (data >> 2) & 1;
+    LCD_D7 = (data >> 3) & 1;
+
+    LCD_Pulse_Enable();
+}
+
+
+void LCD_Command(uint8_t command)
+{
+    LCD_RS = 0;
+
+    LCD_Send_Nibble(command >> 4);
+    LCD_Send_Nibble(command & 0x0F);
+
+    if(command == 0x01 || command == 0x02)
+        __delay_ms(2);
+    else
+        __delay_us(50);
+}
+
+
+void LCD_Data(uint8_t data)
+{
+    LCD_RS = 1;
+
+    LCD_Send_Nibble(data >> 4);
+    LCD_Send_Nibble(data & 0x0F);
+
+    __delay_us(50);
+}
+
+
+void LCD_Init(void)
+{
+    LCD_RS = 0;
+    LCD_EN = 0;
+
+    __delay_ms(20);
+
+    /*
+     * LCD initialization sequence
+     */
+
+    LCD_Send_Nibble(0x03);
+    __delay_ms(5);
+
+    LCD_Send_Nibble(0x03);
+    __delay_us(150);
+
+    LCD_Send_Nibble(0x03);
+
+    LCD_Send_Nibble(0x02);
+
+    /*
+     * 4-bit mode
+     * 2-line display
+     * 5x8 font
+     */
+    LCD_Command(0x28);
+
+    /*
+     * Display ON
+     * Cursor OFF
+     * Blink OFF
+     */
+    LCD_Command(0x0C);
+
+    /*
+     * Clear display
+     */
+    LCD_Command(0x01);
+
+    /*
+     * Entry mode
+     */
+    LCD_Command(0x06);
+}
+
+
+void LCD_Clear(void)
+{
+    LCD_Command(0x01);
+    __delay_ms(2);
+}
+
+
+void LCD_Set_Cursor(uint8_t row, uint8_t column)
+{
+    uint8_t address;
+
+    if(row == 1)
+        address = 0x80 + (column - 1);
+    else
+        address = 0xC0 + (column - 1);
+
+    LCD_Command(address);
+}
+
+
+void LCD_Write_String(const char *text)
+{
+    while(*text)
+    {
+        LCD_Data(*text);
+        text++;
+    }
+}
+
+
+void LCD_Write_Number(uint16_t number)
+{
+    char buffer[6];
+    uint8_t i = 0;
+
+    if(number == 0)
+    {
+        LCD_Data('0');
+        return;
+    }
+
+    while(number > 0)
+    {
+        buffer[i++] = (number % 10) + '0';
+        number /= 10;
+    }
+
+    while(i > 0)
+    {
+        LCD_Data(buffer[--i]);
+    }
+}
+
+
+/*========================================================
+  TIMER1 INITIALIZATION
+========================================================*/
+
+/*
+ * Fosc = 20 MHz
+ *
+ * Instruction frequency:
+ *
+ * Fosc / 4 = 5 MHz
+ *
+ * Timer1 prescaler = 1:8
+ *
+ * Timer1 tick:
+ *
+ * 8 / 5 MHz = 1.6 us
+ *
+ * Required 50 ms:
+ *
+ * 50 ms / 1.6 us = 31250 counts
+ *
+ * Timer1 preload:
+ *
+ * 65536 - 31250 = 34286
+ *
+ * 34286 decimal = 0x85EE
+ */
+
+void Timer1_Init(void)
+{
+    /*
+     * Timer1 OFF initially
+     *
+     * Internal clock = Fosc/4
+     *
+     * Prescaler = 1:8
+     */
+    T1CON = 0x31;
+
+    /*
+     * Preload = 0x85EE
+     */
+    TMR1H = 0x85;
+    TMR1L = 0xEE;
+
+    /*
+     * Clear Timer1 interrupt flag
+     */
+    PIR1bits.TMR1IF = 0;
+
+    /*
+     * Enable Timer1 interrupt
+     */
+    PIE1bits.TMR1IE = 1;
+}
+
+
+/*========================================================
+  EXTERNAL INTERRUPT INITIALIZATION
+========================================================*/
+
+void External_Interrupt_Init(void)
+{
+    /*
+     * RB0 as input
+     */
+    TRISBbits.TRISB0 = 1;
+
+    /*
+     * Interrupt on rising edge
+     */
+    OPTION_REGbits.INTEDG = 1;
+
+    /*
+     * Clear external interrupt flag
+     */
+    INTCONbits.INTF = 0;
+
+    /*
+     * Enable external interrupt
+     */
+    INTCONbits.INTE = 1;
+}
+
+
+/*========================================================
+  INTERRUPT SERVICE ROUTINE
+========================================================*/
+
+void __interrupt() ISR(void)
+{
+    /*
+     * -----------------------------------------------
+     * External interrupt from IR sensor
+     * -----------------------------------------------
+     */
+
+    if(INTCONbits.INTF)
+    {
+        /*
+         * One pulse detected
+         */
+        pulse_count++;
+
+        /*
+         * Clear interrupt flag
+         */
+        INTCONbits.INTF = 0;
+    }
+
+
+    /*
+     * -----------------------------------------------
+     * Timer1 interrupt
+     * -----------------------------------------------
+     */
+
+    if(PIR1bits.TMR1IF)
+    {
+        /*
+         * Reload Timer1 for 50 ms
+         */
+        TMR1H = 0x85;
+        TMR1L = 0xEE;
+
+        /*
+         * Clear Timer1 interrupt flag
+         */
+        PIR1bits.TMR1IF = 0;
+
+        /*
+         * Count 50-ms intervals
+         */
+        timer1_ticks++;
+
+        /*
+         * 20 × 50 ms = 1 second
+         */
+        if(timer1_ticks >= 20)
+        {
+            timer1_ticks = 0;
+
+            /*
+             * Tell main program that
+             * measurement is complete.
+             */
+            measurement_ready = 1;
+        }
+    }
+}
+
+
+/*========================================================
+  INTERRUPT SYSTEM INITIALIZATION
+========================================================*/
+
+void Interrupt_Init(void)
+{
+    /*
+     * Enable peripheral interrupts
+     */
+    INTCONbits.PEIE = 1;
+
+    /*
+     * Enable global interrupts
+     */
+    INTCONbits.GIE = 1;
+}
+
+
+/*========================================================
+  MAIN PROGRAM
+========================================================*/
+
+void main(void)
+{
+    uint16_t pulses;
+    uint16_t rpm;
+
+    /*
+     * Configure PORTD as output
+     */
+    TRISD = 0x00;
+
+    /*
+     * Configure RB0 as input
+     */
+    TRISBbits.TRISB0 = 1;
+
+    /*
+     * Initially turn OFF LED
+     */
+    OVERSPEED_LED = 0;
+
+    /*
+     * Initialize LCD
+     */
+    LCD_Init();
+
+    /*
+     * Initialize Timer1
+     */
+    Timer1_Init();
+
+    /*
+     * Initialize external interrupt
+     */
+    External_Interrupt_Init();
+
+    /*
+     * Enable interrupts
+     */
+    Interrupt_Init();
+
+    /*
+     * Startup message
+     */
+    LCD_Clear();
+
+    LCD_Set_Cursor(1,1);
+    LCD_Write_String("DIGITAL");
+
+    LCD_Set_Cursor(2,1);
+    LCD_Write_String("TACHOMETER");
+
+    __delay_ms(1500);
+
+    LCD_Clear();
+
+    LCD_Set_Cursor(1,1);
+    LCD_Write_String("RPM:");
+
+    /*
+     * Main loop
+     */
+    while(1)
+    {
+        /*
+         * Wait until 1-second measurement
+         * is completed.
+         */
+        if(measurement_ready)
+        {
+            /*
+             * Temporarily disable interrupts
+             * while copying pulse count.
+             */
+            INTCONbits.GIE = 0;
+
+            pulses = pulse_count;
+
+            /*
+             * Reset pulse counter for
+             * next measurement period.
+             */
+            pulse_count = 0;
+
+            measurement_ready = 0;
+
+            /*
+             * Re-enable interrupts
+             */
+            INTCONbits.GIE = 1;
+
+
+            /*
+             * ------------------------------------
+             * RPM CALCULATION
+             * ------------------------------------
+             *
+             * Measurement window = 1 second
+             *
+             * Pulses/sec = pulses
+             *
+             * Revolutions/sec =
+             *
+             * pulses / PPR
+             *
+             * RPM =
+             *
+             * (pulses × 60) / PPR
+             */
+
+            rpm = (uint16_t)
+                  ((pulses * 60UL) /
+                   PULSES_PER_REVOLUTION);
+
+
+            /*
+             * ------------------------------------
+             * DISPLAY RPM
+             * ------------------------------------
+             */
+
+            LCD_Set_Cursor(1,1);
+            LCD_Write_String("RPM:       ");
+
+            LCD_Set_Cursor(1,5);
+            LCD_Write_Number(rpm);
+
+
+            /*
+             * ------------------------------------
+             * OVER-SPEED DETECTION
+             * ------------------------------------
+             */
+
+            if(rpm > MAX_RPM)
+            {
+                OVERSPEED_LED = 1;
+
+                LCD_Set_Cursor(2,1);
+                LCD_Write_String("OVER SPEED   ");
+            }
+            else
+            {
+                OVERSPEED_LED = 0;
+
+                LCD_Set_Cursor(2,1);
+                LCD_Write_String("NORMAL SPEED ");
+            }
+        }
+    }
+}
